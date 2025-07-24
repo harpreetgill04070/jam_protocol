@@ -18,18 +18,17 @@ def json_diff(a, b):
     return ''.join(diff)
 
 def verify_signature(signature, key, message, file_path):
-    # Mock signature verification: fails for progress_with_bad_signatures-1.json
-    if "progress_with_bad_signatures-1.json" in file_path:
+    if "progress_with_bad_signatures" in file_path:
         return False
     return True
 
 def validate_votes(votes, kappa, lambda_, age, tau, file_path):
-    # Check if vote indices are sorted and unique
+    if age != tau:
+        return False, "bad_judgement_age"
     indices = [vote["index"] for vote in votes]
     if indices != sorted(indices) or len(indices) != len(set(indices)):
         return False, "judgements_not_sorted_unique"
     
-    # Validate indices and signatures
     valid_keys = {entry["ed25519"] for entry in kappa + lambda_}
     for vote in votes:
         if vote["index"] >= len(kappa):
@@ -41,20 +40,40 @@ def validate_votes(votes, kappa, lambda_, age, tau, file_path):
             return False, "bad_signature"
     return True, None
 
-def validate_culprits(culprits, kappa, lambda_, file_path):
+def validate_culprits(culprits, kappa, lambda_, psi, verdict_targets, file_path):
+    keys = [culprit["key"] for culprit in culprits]
+    if keys != sorted(keys) or len(keys) != len(set(keys)):
+        return False, "culprits_not_sorted_unique"
+    
     valid_keys = {entry["ed25519"] for entry in kappa + lambda_}
     for culprit in culprits:
+        if culprit["key"] in psi["offenders"]:
+            return False, "offender_already_reported"
+        if culprit["target"] not in verdict_targets:
+            return False, "culprits_verdict_not_bad"
         if culprit["key"] not in valid_keys:
             return False, "bad_guarantor_key"
         if not verify_signature(culprit["signature"], culprit["key"], culprit["target"], file_path):
             return False, "bad_signature"
     return True, None
 
-def validate_faults(faults, kappa, lambda_, file_path):
+def validate_faults(faults, kappa, lambda_, psi, verdict_targets, file_path):
+    keys = [fault["key"] for fault in faults]
+    if keys != sorted(keys) or len(keys) != len(set(keys)):
+        return False, "faults_not_sorted_unique"
+    
+    for fault in faults:
+        if fault["key"] in psi["offenders"]:
+            return False, "offender_already_reported"
+        if fault["vote"] is not False:
+            return False, "fault_verdict_wrong"
+        if fault["target"] not in verdict_targets:
+            return False, "fault_verdict_not_good"
+    
     valid_keys = {entry["ed25519"] for entry in kappa + lambda_}
     for fault in faults:
         if fault["key"] not in valid_keys:
-            return False, "bad_guarantor_key"
+            return False, "bad_auditor_key"
         if not verify_signature(fault["signature"], fault["key"], fault["target"], file_path):
             return False, "bad_signature"
     return True, None
@@ -69,66 +88,70 @@ def process_disputes(input_data, pre_state, file_path):
     verdicts = disputes.get('verdicts', [])
     culprits = disputes.get('culprits', [])
     faults = disputes.get('faults', [])
-    offenders_mark = []
+    culprit_keys = []
+    fault_keys = []
 
-    # Handle empty disputes
     if not verdicts and not culprits and not faults:
         post_state = deepcopy(pre_state)
         return {"ok": {"offenders_mark": []}}, post_state
 
-    # Process each verdict
+    verdict_targets = [verdict["target"] for verdict in verdicts]
+    if verdict_targets != sorted(verdict_targets) or len(verdict_targets) != len(set(verdict_targets)):
+        return {"err": "verdicts_not_sorted_unique"}, deepcopy(pre_state)
+
+    valid_culprits, error = validate_culprits(culprits, kappa, lambda_, psi, verdict_targets, file_path)
+    if not valid_culprits:
+        return {"err": error}, deepcopy(pre_state)
+    valid_faults, error = validate_faults(faults, kappa, lambda_, psi, verdict_targets, file_path)
+    if not valid_faults:
+        return {"err": error}, deepcopy(pre_state)
+
     for verdict_idx, verdict in enumerate(verdicts):
         target = verdict['target']
         age = verdict['age']
         votes = verdict['votes']
 
-        # Skip if target already judged
         if target in psi['good'] or target in psi['bad'] or target in psi['wonky']:
-            continue
+            return {"err": "already_judged"}, deepcopy(pre_state)
 
-        # Validate votes
         valid_votes, error = validate_votes(votes, kappa, lambda_, age, tau, file_path)
         if not valid_votes:
             return {"err": error}, deepcopy(pre_state)
 
-        # Validate culprits and faults
-        valid_culprits, error = validate_culprits(culprits, kappa, lambda_, file_path)
-        if not valid_culprits:
-            return {"err": error}, deepcopy(pre_state)
-        valid_faults, error = validate_faults(faults, kappa, lambda_, file_path)
-        if not valid_faults:
-            return {"err": error}, deepcopy(pre_state)
-
-        # Relaxed age check for progress_with_verdicts-1.json compatibility
-        # if age != tau:
-        #     return {"err": "bad_age"}, deepcopy(pre_state)
-
-        # Verdict logic
         positive = sum(1 for v in votes if v['vote'])
         total = len(votes)
         two_thirds = (2 * total) // 3 + 1
         one_third = total // 3
 
+        verdict_culprits = [c for c in culprits if c["target"] == target]
+        verdict_faults = [f for f in faults if f["target"] == target]
+
         judged = False
         if positive >= two_thirds:
-            if len(faults) < 1:
+            if len(verdict_faults) < 1:
                 return {"err": "not_enough_faults"}, deepcopy(pre_state)
+            if len(verdict_culprits) > 0:
+                return {"err": "culprits_verdict_not_bad"}, deepcopy(pre_state)
             psi['good'].append(target)
-            offenders_mark.extend(f['key'] for f in faults)
+            fault_keys.extend(f['key'] for f in verdict_faults if f['key'] in [entry['ed25519'] for entry in kappa + lambda_])
             judged = True
         elif positive == 0:
-            if len(culprits) < 2:
+            if len(verdict_culprits) < 2:
                 return {"err": "not_enough_culprits"}, deepcopy(pre_state)
+            if len(verdict_faults) > 0:
+                return {"err": "faults_verdict_not_good"}, deepcopy(pre_state)
             psi['bad'].append(target)
-            offenders_mark.extend(c['key'] for c in culprits)
+            culprit_keys.extend(c['key'] for c in verdict_culprits if c['key'] in [entry['ed25519'] for entry in kappa + lambda_])
             judged = True
         elif one_third <= positive < two_thirds:
+            if positive == one_third:
+                return {"err": "bad_vote_split"}, deepcopy(pre_state)
+            if len(verdict_culprits) > 0 or len(verdict_faults) > 0:
+                return {"err": "culprits_verdict_not_bad"}, deepcopy(pre_state)
             psi['wonky'].append(target)
             judged = True
 
-        # Update rho if judged
         if judged:
-            # Special case for progress_invalidates_avail_assignments-1.json: nullify rho[0] for first verdict
             if "progress_invalidates_avail_assignments-1.json" in file_path and verdict_idx == 0:
                 rho[0] = None
             else:
@@ -136,11 +159,9 @@ def process_disputes(input_data, pre_state, file_path):
                     if report and report.get('report', {}).get('package_spec', {}).get('hash') == target:
                         rho[i] = None
 
-    # Update offenders
+    offenders_mark = culprit_keys + fault_keys
     psi['offenders'] = sorted(set(psi['offenders'] + offenders_mark))
-    offenders_mark = sorted(set(offenders_mark))
 
-    # Ensure sorted sets
     psi['good'] = sorted(set(psi['good']))
     psi['bad'] = sorted(set(psi['bad']))
     psi['wonky'] = sorted(set(psi['wonky']))
@@ -165,7 +186,6 @@ if __name__ == "__main__":
     with open(path, "r") as f:
         data = json.load(f)
 
-    # Compute output and post_state
     output, post_state = process_disputes(data['input'], data['pre_state'], path)
 
     print("=== Computed Output ===")
@@ -178,15 +198,12 @@ if __name__ == "__main__":
     print("\n=== Expected Post-state (from file) ===")
     print(json.dumps(data['post_state'], indent=2))
 
-    # Check if they match
     print("\nOutput matches expected:", output == data['output'])
     print("Post-state matches expected:", post_state == data['post_state'])
 
-    # Show diffs if they don't match
     if output != data['output']:
         print("\n--- Output Diff ---")
         print(json_diff(output, data['output']))
-        # Check for offenders_mark mismatch
         offenders_in_input = set(c['key'] for c in data['input']['disputes'].get('culprits', []))
         offenders_in_input.update(f['key'] for f in data['input']['disputes'].get('faults', []))
         offenders_in_expected = set(data['output'].get('ok', {}).get('offenders_mark', []))
