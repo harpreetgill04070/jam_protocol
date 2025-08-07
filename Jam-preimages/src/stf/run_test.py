@@ -48,7 +48,7 @@ def run_preimage_test(test: PreimagesTestVector) -> bool:
         requester = preimage.requester
         blob = preimage.blob
         hash_value = hash_blob(blob)
-        blob_length = (len(blob) - 2) // 2  # Hex string length in bytes
+        blob_length = (len(blob) - 2) // 2 
 
         account = None
         for acc in new_state.accounts:
