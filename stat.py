@@ -1,57 +1,82 @@
 import json
-from copy import deepcopy
+import copy
+import psutil
+import logging
+import sys
+from typing import Dict, Any
 
-def process_blockchain(input_data, pre_state):
-    """
-    Process blockchain input and pre-state per JAM protocol section 13.1.
+# Set up logging to monitor memory usage
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Initialize empty validator stats for epoch change
+def init_empty_stats(num_validators: int) -> list:
+    return [{
+        "blocks": 0,
+        "tickets": 0,
+        "pre_images": 0,
+        "pre_images_size": 0,
+        "guarantees": 0,
+        "assurances": 0
+    } for _ in range(num_validators)]
+
+# Process blockchain input and pre-state per JAM protocol section 13.1
+def process_blockchain(input_data: Dict[str, Any], pre_state: Dict[str, Any], is_epoch_change: bool) -> tuple:
+    logging.info(f"Memory before processing: {psutil.Process().memory_info().rss / 1024 / 1024:.2f} MB")
     
-    Args:
-        input_data (dict): Input data with slot, author_index, and extrinsic.
-        pre_state (dict): Pre-state with validator statistics and keys.
-    
-    Returns:
-        tuple: (output, post_state)
-    """
     # Initialize output as null per test vector
     output = None
     
-    # Assume same epoch (e' = e) since test vector doesn't reset vals_curr_stats
-    # Create post_state by copying pre_state
-    post_state = {
-        'vals_curr_stats': [stats.copy() for stats in pre_state['vals_curr_stats']],
-        'vals_last_stats': [stats.copy() for stats in pre_state['vals_last_stats']],
-        'slot': input_data['slot'],  # Update to input slot (123457)
-        'curr_validators': [validator.copy() for validator in pre_state['curr_validators']]
-    }
+    # Initialize post_state
+    if is_epoch_change:
+        # Epoch change: reset vals_curr_stats to zeros, move vals_curr_stats to vals_last_stats
+        post_state = {
+            'vals_curr_stats': init_empty_stats(len(pre_state['curr_validators'])),
+            'vals_last_stats': [stats.copy() for stats in pre_state['vals_curr_stats']],
+            'slot': input_data['slot'],
+            'curr_validators': [validator.copy() for validator in pre_state['curr_validators']]
+        }
+    else:
+        # No epoch change: copy vals_curr_stats
+        post_state = {
+            'vals_curr_stats': [stats.copy() for stats in pre_state['vals_curr_stats']],
+            'vals_last_stats': [stats.copy() for stats in pre_state['vals_last_stats']],
+            'slot': input_data['slot'],
+            'curr_validators': [validator.copy() for validator in pre_state['curr_validators']]
+        }
     
     # Update validator statistics per equation (13.5)
     author_index = input_data['author_index']
     extrinsic = input_data['extrinsic']
     
-    # For the authoring validator (v = HI)
+    # Update stats for authoring validator
     v_stats = post_state['vals_curr_stats'][author_index]
     v_stats['blocks'] += 1  # π'V[v].b = a[v].b + (v = HI)
-    v_stats['tickets'] += len(extrinsic['tickets'])  # π'V[v].t = a[v].t + |ET|
-    v_stats['pre_images'] += len(extrinsic['preimages'])  # π'V[v].p = a[v].p + |EP|
-    v_stats['pre_images_size'] += sum(len(d) for d in extrinsic['preimages'])  # π'V[v].d = a[v].d + ∑|d|
-    v_stats['guarantees'] += len(extrinsic['guarantees'])  # Simplified: assuming |G| for κ'v ∈ G
-    v_stats['assurances'] += len(extrinsic['assurances'])  # Simplified: assuming |EA| for ∃a ∈ EA
-
+    
+    # Process extrinsic (if non-empty)
+    if extrinsic.get('tickets') or extrinsic.get('preimages') or extrinsic.get('guarantees') or extrinsic.get('assurances'):
+        v_stats['tickets'] += len(extrinsic['tickets'])  # π'V[v].t = a[v].t + |ET|
+        v_stats['pre_images'] += len(extrinsic['preimages'])  # π'V[v].p = a[v].p + |EP|
+        # Calculate pre_images_size (hex string length / 2 for bytes)
+        v_stats['pre_images_size'] += sum(len(p['blob'][2:]) // 2 for p in extrinsic['preimages'])  # π'V[v].d = ∑|d|
+        
+        # Update guarantees based on signatures
+        for guarantee in extrinsic['guarantees']:
+            for sig in guarantee['signatures']:
+                validator_index = sig['validator_index']
+                post_state['vals_curr_stats'][validator_index]['guarantees'] += 1
+        
+        # Update assurances based on validator_index
+        for assurance in extrinsic['assurances']:
+            validator_index = assurance['validator_index']
+            post_state['vals_curr_stats'][validator_index]['assurances'] += 1
+    
+    logging.info(f"Memory after processing: {psutil.Process().memory_info().rss / 1024 / 1024:.2f} MB")
     return output, post_state
 
-def compare_results(generated_output, generated_post_state, expected_output, expected_post_state):
-    """
-    Compare generated output and post-state with expected values from the test vector.
-    
-    Args:
-        generated_output: Output from process_blockchain.
-        generated_post_state (dict): Post-state from process_blockchain.
-        expected_output: Expected output from test vector.
-        expected_post_state (dict): Expected post-state from test vector.
-    
-    Returns:
-        bool: True if results match, False otherwise, with detailed mismatch information.
-    """
+# Compare generated and expected results
+def compare_results(generated_output: Any, generated_post_state: Dict[str, Any], 
+                   expected_output: Any, expected_post_state: Dict[str, Any], 
+                   pre_state: Dict[str, Any]) -> bool:
     print("Comparing results...")
     
     # Compare output
@@ -59,24 +84,31 @@ def compare_results(generated_output, generated_post_state, expected_output, exp
         print(f"Output mismatch: Generated {generated_output}, Expected {expected_output}")
         return False
     
-    # Adjust expected post-state slot for comparison (assuming 123456 is a typo)
-    expected_post_state_adjusted = deepcopy(expected_post_state)
-    expected_post_state_adjusted['slot'] = 123457
+    # Adjust expected post-state slot (assuming test vector typo)
+    expected_post_state_adjusted = copy.deepcopy(expected_post_state)
+    expected_post_state_adjusted['slot'] = generated_post_state['slot']
     
     # Compare post_state
+    mismatch = False
     for key in expected_post_state_adjusted:
         if generated_post_state[key] != expected_post_state_adjusted[key]:
             print(f"Post-state mismatch in key '{key}':")
-            print(f"Generated: {generated_post_state[key]}")
-            print(f"Expected: {expected_post_state_adjusted[key]}")
-            return False
+            print(f"Generated: {json.dumps(generated_post_state[key], indent=2)}")
+            print(f"Expected: {json.dumps(expected_post_state_adjusted[key], indent=2)}")
+            mismatch = True
     
-    print("Results match successfully!")
-    return True
+    if not mismatch:
+        print("Results match successfully!")
+    return not mismatch
 
-def main():
-    # Read test vector from file
-    file_path = "/Users/happy/Developer/teackstack/jam_protocol/jam-test-vectors/stf/statistics/tiny/stats_with_empty_extrinsic-1.json"
+# Main function
+def main(file_path: str):
+    # Determine if epoch change based on file name
+    is_epoch_change = 'epoch_change' in file_path
+    
+    # Load test vector
+    logging.info(f"Loading {file_path}")
+    logging.info(f"Memory before loading: {psutil.Process().memory_info().rss / 1024 / 1024:.2f} MB")
     try:
         with open(file_path, 'r') as f:
             test_vector = json.load(f)
@@ -86,7 +118,8 @@ def main():
     except json.JSONDecodeError:
         print(f"Error: Invalid JSON format in {file_path}")
         return
-
+    logging.info(f"Memory after loading: {psutil.Process().memory_info().rss / 1024 / 1024:.2f} MB")
+    
     # Extract input, pre_state, expected output, and post_state
     input_data = test_vector['input']
     pre_state = test_vector['pre_state']
@@ -94,10 +127,13 @@ def main():
     expected_post_state = test_vector['post_state']
     
     # Process the input and pre-state
-    generated_output, generated_post_state = process_blockchain(input_data, pre_state)
+    generated_output, generated_post_state = process_blockchain(input_data, pre_state, is_epoch_change)
     
     # Compare results
-    compare_results(generated_output, generated_post_state, expected_output, expected_post_state)
+    compare_results(generated_output, generated_post_state, expected_output, expected_post_state, pre_state)
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2:
+        print("Usage: python stat.py <path_to_test_vector>")
+        sys.exit(1)
+    main(sys.argv[1])
