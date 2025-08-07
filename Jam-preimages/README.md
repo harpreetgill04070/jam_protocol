@@ -1,6 +1,6 @@
 # JAM Preimages STF Tests - Python Implementation
 
-This is a Python conversion of the TypeScript JAM Preimages STF (State Transition Function) test suite.
+This is a Python conversion of  JAM Preimages STF (State Transition Function) test suite.
 
 ## Project Structure
 
@@ -27,7 +27,7 @@ Jam-preimages/
 
 ## Features
 
-- **Complete Python conversion** of the original TypeScript implementation
+- **Complete Python conversion** of the original implementation
 - **Type-safe data structures** using Python dataclasses
 - **BLAKE2b-256 hashing** using Python's built-in hashlib
 - **Comprehensive test validation** including:
@@ -74,7 +74,7 @@ Each test vector includes:
 
 ## Implementation Details
 
-This Python implementation maintains exact functional equivalence with the original TypeScript version:
+This Python implementation maintains exact functional equivalence with the original version:
 
 1. **State Processing**: Deep copies state for mutation-safe processing
 2. **Hash Validation**: Uses BLAKE2b-256 for preimage hash computation  
@@ -85,6 +85,6 @@ This Python implementation maintains exact functional equivalence with the origi
 ## Test Results
 
 The test runner provides detailed output including:
-- ✅ Passed tests
-- ❌ Failed tests with detailed error information
-- 🧪 Total test count and summary statistics
+- Passed tests
+-  Failed tests with detailed error information
+-  Total test count and summary statistics
